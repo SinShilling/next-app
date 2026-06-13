@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from database import Base, engine, get_db
 from pydantic import BaseModel
 from pydantic import BaseModel as PydanticBase
+from services.youtube import fetch_youtube_suggestion
 from datetime import datetime, timezone
 import models
 import random
@@ -36,12 +37,11 @@ def root():
     return {"message": "NEXT backend is running"}
 
 @app.get("/suggest")
-def suggest(
+async def suggest(                          # ← async now
     mood: str = "bored",
     time: int = 30,
     db: Session = Depends(get_db)
 ):
-    # Mood → preferred categories with weights
     MOOD_WEIGHTS = {
         "focused":  {"study": 3.0,  "stimulate": 1.0, "browse": 0.5, "game": 0.2},
         "bored":    {"study": 1.0,  "stimulate": 2.0, "browse": 2.0, "game": 2.0},
@@ -49,21 +49,35 @@ def suggest(
         "creative": {"stimulate": 3.0, "browse": 2.0, "study": 1.0, "game": 0.5},
     }
     weights = MOOD_WEIGHTS.get(mood, {})
-
     now = datetime.now(timezone.utc)
 
-    # Fetch all items, apply hard filters
+    # Decide whether to try YouTube (focused/bored → study, lazy/bored → browse)
+    youtube_categories = {
+        "focused": "study",
+        "bored": "browse",
+        "lazy": "browse",
+        "creative": "study",
+    }
+    yt_category = youtube_categories.get(mood)
+
+    # 40% chance to try YouTube when mood matches
+    import random
+    use_youtube = yt_category and random.random() < 0.4
+    
+    if use_youtube:
+        yt_suggestion = await fetch_youtube_suggestion(yt_category)
+        if yt_suggestion:
+            return yt_suggestion
+
+    # Fall back to DB items
     all_items = db.query(models.Item).all()
 
     filtered = []
     for item in all_items:
-        # Hard filter 1: duration
         if item.duration_minutes and item.duration_minutes > time:
             continue
-        # Hard filter 2: too many skips
         if item.skip_count >= 5:
             continue
-        # Hard filter 3: suggested too recently (within 30 mins)
         if item.last_suggested_at:
             last = item.last_suggested_at.replace(tzinfo=timezone.utc)
             minutes_ago = (now - last).total_seconds() / 60
@@ -74,16 +88,13 @@ def suggest(
     if not filtered:
         return {"error": "No suggestions available right now. Try a longer time or wait a bit."}
 
-    # Score remaining items
     def score(item):
         mood_bonus = weights.get(item.category, 1.0)
         skip_penalty = item.skip_count * 0.5
-        noise = random.uniform(0, 0.5)   # small random nudge
+        noise = random.uniform(0, 0.5)
         return mood_bonus - skip_penalty + noise
 
     best = sorted(filtered, key=score, reverse=True)[0]
-
-    # Update last_suggested_at
     best.last_suggested_at = now.replace(tzinfo=None)
     db.commit()
 
